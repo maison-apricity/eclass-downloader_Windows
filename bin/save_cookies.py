@@ -6,7 +6,7 @@ import json, sys, pathlib, time
 from selenium import webdriver
 
 BASE=pathlib.Path(__file__).resolve().parent
-PROFILE=BASE/"selenium-profile"
+PROFILE=BASE/"cookie-capture-profile"
 COOKIES=BASE/"cookies.json"
 
 print("[INFO ] 로그인을 완료하면 명령창으로 돌아와 Enter를 입력해주십시오.\n")

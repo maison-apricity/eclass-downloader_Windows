@@ -94,6 +94,9 @@ def poll_video(max_wait: int = 120) -> tuple[str, float]:
     return '', 0.0
 
 # ───────────────────────── 쿠키 확인 및 로드 ────────────────────────── #
+from urllib.parse import urlparse
+from selenium.common.exceptions import WebDriverException
+
 BIN_DIR.mkdir(exist_ok=True)
 PROFILE_DIR.mkdir(exist_ok=True)
 print('[쿠키 확인] cookies.json 상태 점검...', end=' ')
@@ -129,37 +132,185 @@ print(f'[완료] 강좌 주소 설정: {COURSE_URL}\n')
 
 # ───────────────────────── Chrome WebDriver 초기화 ─────────────────── #
 print('[브라우저] Chrome 드라이버 실행...')
+
+from selenium.webdriver.chrome.service import Service
+
+CHROMEDRIVER_LOG = BIN_DIR / "chromedriver.log"
+CHROME_STDERR_LOG = BIN_DIR / "chrome_stderr.log"
+
+# Windows에서는 Chrome 자체 stderr를 보려면 CHROME_LOG_FILE 필요
+os.environ["CHROME_LOG_FILE"] = str(CHROME_STDERR_LOG)
+
 opts = webdriver.ChromeOptions()
-opts.add_argument('--headless=new')
-opts.add_argument('--mute-audio')          
-opts.add_argument(f'--user-data-dir={PROFILE_DIR}')
+
+# headless는 공식 문서 기준으로 --headless 사용
+opts.add_argument('--headless')
+# Windows에서 headless 관련 크래시 우회 옵션
+opts.add_argument('--disable-gpu')
+
+opts.add_argument('--mute-audio')
+opts.add_argument('--no-first-run')
+opts.add_argument('--no-default-browser-check')
+opts.add_argument('--disable-background-networking')
+opts.add_argument('--disable-extensions')
+opts.add_argument('--remote-debugging-port=0')
+opts.add_argument('--window-size=1920,1080')
+
 opts.add_experimental_option('excludeSwitches', ['enable-logging'])
-opts.add_argument('--disable-logging')               
-opts.add_argument('--log-level=3')                 
+opts.add_argument('--log-level=3')
 
-from selenium.webdriver.chrome.service import Service 
-service = Service(log_path=os.devnull)              
+# log_path=os.devnull 로 버리지 말고 실제 로그를 남김
+service = Service(
+    log_path=str(CHROMEDRIVER_LOG),
+    service_args=['--verbose']
+)
 
-driver = webdriver.Chrome(service=service, options=opts)
+try:
+    driver = webdriver.Chrome(service=service, options=opts)
+except Exception as e:
+    print(f'[1차 실패] headless Chrome 시작 실패: {e}')
+    print('[재시도] headless 옵션을 제거하고 일반 모드로 다시 시도합니다...')
+
+    opts2 = webdriver.ChromeOptions()
+    opts2.add_argument('--mute-audio')
+    opts2.add_argument('--no-first-run')
+    opts2.add_argument('--no-default-browser-check')
+    opts2.add_argument('--disable-background-networking')
+    opts2.add_argument('--disable-extensions')
+    opts2.add_argument('--window-size=1920,1080')
+    opts2.add_experimental_option('excludeSwitches', ['enable-logging'])
+    opts2.add_argument('--log-level=3')
+
+    driver = webdriver.Chrome(service=service, options=opts)
 driver.implicitly_wait(8)
 wait = WebDriverWait(driver, 20)
 print('[완료] 드라이버 준비 완료\n')
 
 # ───────────────────────────── 쿠키 주입 ───────────────────────────── #
 print('[쿠키 주입] 브라우저에 쿠키 적용...')
-for dom in {c['domain'] for c in COOKIES if c.get('domain')}:
-    driver.get(f'https://{dom.lstrip(".")}/')
-    for c in [x for x in COOKIES if x['domain'] == dom]:
-        ent = {'name': c['name'], 'value': c['value'], 'path': c.get('path','/')}
-        if isinstance(c.get('expiry'), (int, float)):
-            ent['expiry'] = int(c['expiry'])
-        driver.add_cookie(ent)
+
+CANVAS_HOST = 'canvas.cau.ac.kr'
+ECLASS_HOST = 'eclass3.cau.ac.kr'
+
+def domain_matches(cookie_domain: str, host: str) -> bool:
+    cd = cookie_domain.lstrip('.').lower()
+    h = host.lower()
+    return h == cd or h.endswith('.' + cd)
+
+def build_cookie_entry(c: dict, current_host: str) -> dict:
+    cookie_domain = c.get('domain', '')
+    ent = {
+        'name': c['name'],
+        'value': c['value'],
+        'path': c.get('path', '/'),
+    }
+
+    if isinstance(c.get('expiry'), (int, float)):
+        ent['expiry'] = int(c['expiry'])
+
+    if 'secure' in c:
+        ent['secure'] = bool(c['secure'])
+
+    if 'httpOnly' in c:
+        ent['httpOnly'] = bool(c['httpOnly'])
+
+    if c.get('sameSite') in ('Strict', 'Lax', 'None'):
+        ent['sameSite'] = c['sameSite']
+
+    # 현재 host와 정확히 같은 쿠키는 domain 생략
+    # 상위 도메인(.cau.ac.kr) 쿠키만 domain 명시
+    if cookie_domain and cookie_domain.lstrip('.').lower() != current_host.lower():
+        ent['domain'] = cookie_domain
+
+    return ent
+
+def open_host_anchor(expected_host: str, urls: list[str]) -> bool:
+    for url in urls:
+        try:
+            driver.get(url)
+            cur = (urlparse(driver.current_url).hostname or '').lower()
+            print(f'[앵커] 요청={url}')
+            print(f'[앵커] 현재={driver.current_url}')
+            if cur == expected_host.lower():
+                return True
+        except Exception as e:
+            print(f'[앵커 실패] {url} -> {e}')
+    return False
+
+def inject_cookies_for_host(expected_host: str, cookies: list[dict]) -> int:
+    current_host = (urlparse(driver.current_url).hostname or '').lower()
+    print(f'[주입] expected_host={expected_host}, current_host={current_host}')
+
+    if current_host != expected_host.lower():
+        print(f'[경고] 현재 host가 {expected_host} 가 아니므로 해당 host 쿠키 주입을 건너뜁니다.')
+        return 0
+
+    added = 0
+    for c in cookies:
+        cookie_domain = c.get('domain', '')
+        if not cookie_domain:
+            continue
+        if not domain_matches(cookie_domain, expected_host):
+            continue
+
+        ent = build_cookie_entry(c, current_host)
+
+        try:
+            driver.add_cookie(ent)
+            print(f"[추가] {c['name']} @ {cookie_domain}")
+            added += 1
+        except WebDriverException as e:
+            print(f"[실패] {c['name']} @ {cookie_domain} -> {e}")
+
+    return added
+
+# 1) canvas host에 먼저 진입해서 canvas/.cau 쿠키 주입
+canvas_anchor_ok = open_host_anchor(CANVAS_HOST, [
+    'https://canvas.cau.ac.kr/favicon.ico',
+    'https://canvas.cau.ac.kr/robots.txt',
+    'https://canvas.cau.ac.kr/login?type=integrated',
+])
+
+if not canvas_anchor_ok:
+    print('[오류] canvas host에 앵커 페이지를 열지 못했습니다.')
+    driver.quit()
+    sys.exit(1)
+
+canvas_added = inject_cookies_for_host(CANVAS_HOST, COOKIES)
+print(f'[완료] canvas 단계 쿠키 주입: {canvas_added}개')
+driver.refresh()
+
+# 2) eclass host에 진입해서 eclass/.cau 쿠키 주입
+eclass_anchor_ok = open_host_anchor(ECLASS_HOST, [
+    'https://eclass3.cau.ac.kr/favicon.ico',
+    'https://eclass3.cau.ac.kr/robots.txt',
+    'https://eclass3.cau.ac.kr/learningx/login',
+])
+
+if not eclass_anchor_ok:
+    print('[오류] eclass host에 앵커 페이지를 열지 못했습니다.')
+    print('[힌트] 현재 쿠키가 만료되었거나, SSO 흐름이 바뀌었을 가능성이 큽니다.')
+    driver.quit()
+    sys.exit(1)
+
+eclass_added = inject_cookies_for_host(ECLASS_HOST, COOKIES)
+print(f'[완료] eclass 단계 쿠키 주입: {eclass_added}개')
+driver.refresh()
+
 print('[완료] 쿠키 주입 완료\n')
 
 # ──────────────── 강좌 페이지 로드 및 저장 디렉터리 생성 ─────────────── #
 print('[강좌 확인] 강좌 페이지 로드...')
 driver.get(COURSE_URL)
 title = driver.title.strip()
+
+if '로그인' in title or (urlparse(driver.current_url).hostname or '').lower() != ECLASS_HOST:
+    print(f'[오류] 로그인 세션 복원 실패: title={title}')
+    print(f'[오류] current_url={driver.current_url}')
+    print('[조치] bin/save_cookies.py 를 다시 실행해서 쿠키를 재캡처하십시오.')
+    driver.quit()
+    sys.exit(1)
+
 print(f'[강좌 확인] 강좌명: {title}')
 if input('[강좌 확인] 계속 진행하시겠습니까? (y/n) ▶ ').lower() != 'y':
     driver.quit()
