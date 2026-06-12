@@ -71,14 +71,6 @@ eclass_downloader.bat
 
 ---
 
-## 기여
-
-1. Fork 저장소
-2. 새로운 브랜치에서 수정
-3. Pull Request 생성
-
----
-
 ## 라이선스
 
 MIT
